@@ -83,6 +83,9 @@ class Frame:
             HEADER_FORMAT, data[:HEADER_SIZE]
         )
 
+        if version != PROTOCOL_VERSION:
+            raise FrameError(f"Неподдерживаемая версия протокола: {version}")
+
         if payload_length > MAX_FRAME_PAYLOAD:
             raise FrameError(
                 f"payload_length {payload_length} > MAX_FRAME_PAYLOAD "
@@ -126,6 +129,10 @@ class FrameBuffer:
             version, msg_type, flags, request_id, payload_length = struct.unpack(
                 HEADER_FORMAT, self._buf[:HEADER_SIZE]
             )
+
+            if version != PROTOCOL_VERSION:
+                self._buf.clear()
+                raise FrameError(f"Неподдерживаемая версия протокола: {version}")
 
             if payload_length > MAX_FRAME_PAYLOAD:
                 self._buf.clear()

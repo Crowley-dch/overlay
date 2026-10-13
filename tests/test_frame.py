@@ -197,3 +197,41 @@ def test_stream_100_frames_random_split():
         assert original.request_id == result.request_id
         assert original.payload == result.payload
         assert original.version == result.version
+def test_decode_rejects_unknown_version():
+    header = struct.pack(
+        "!BBH16sI",
+        99,
+        MessageType.PING,
+        0,
+        make_request_id(20),
+        0,
+    )
+    with pytest.raises(FrameError):
+        Frame.decode(header)
+
+
+def test_buffer_rejects_unknown_version():
+    buf = FrameBuffer()
+    header = struct.pack(
+        "!BBH16sI",
+        99,
+        MessageType.PING,
+        0,
+        make_request_id(21),
+        0,
+    )
+    with pytest.raises(FrameError):
+        buf.feed(header)
+
+
+def test_buffer_partial_header_then_garbage_does_not_lose_boundary():
+    buf = FrameBuffer()
+    f = Frame(msg_type=MessageType.PING, request_id=make_request_id(22), payload=b"x")
+    encoded = f.encode()
+
+    frames = buf.feed(encoded[:10])
+    assert frames == []
+
+    frames = buf.feed(encoded[10:])
+    assert len(frames) == 1
+    assert frames[0].payload == b"x"       

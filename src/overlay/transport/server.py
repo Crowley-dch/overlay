@@ -9,7 +9,12 @@ from overlay.transport.connection import (
     ConnectionClosed,
     ConnectionTimeout,
 )
-from overlay.transport.frame import Frame, FrameFlags, MessageType
+from overlay.transport.frame import (
+    Frame,
+    FrameError,
+    FrameFlags,
+    MessageType,
+)
 
 log = logging.getLogger(__name__)
 
@@ -17,7 +22,6 @@ ConnectionHandler = Callable[[Connection], Awaitable[None]]
 
 
 class Server:
-    
     def __init__(
         self,
         host: str,
@@ -63,6 +67,7 @@ class Server:
                 await asyncio.wait_for(server.wait_closed(), timeout=timeout)
             except asyncio.TimeoutError:
                 log.warning("Server.wait_closed() не завершился за %ss", timeout)
+
     async def _on_client(
         self,
         reader: asyncio.StreamReader,
@@ -78,30 +83,53 @@ class Server:
             log.info("Соединение %s закрыто", conn.connection_id)
         except ConnectionTimeout:
             log.warning("Тайм-аут на %s", conn.connection_id)
+        except FrameError as e:
+            log.warning("Ошибка кадрирования на %s: %s", conn.connection_id, e)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             log.exception("Ошибка в обработчике %s", conn.connection_id)
         finally:
             conn.close()
-            await conn.wait_closed()
+            try:
+                await asyncio.wait_for(conn.wait_closed(), timeout=1.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
             if task is not None:
                 self._tasks.discard(task)
 
 
 async def echo_ping_handler(conn: Connection) -> None:
     log.info("Новое соединение: %s", conn)
-    try:
-        while True:
+    while True:
+        try:
             frame = await conn.recv()
-            if frame.msg_type == MessageType.PING:
-                pong = Frame(
+        except ConnectionClosed:
+            raise
+        except FrameError as e:
+            log.warning("Ошибка кадра от %s: %s", conn.connection_id, e)
+            raise
+
+        if frame.msg_type == MessageType.PING:
+            await conn.send(
+                Frame(
                     msg_type=MessageType.PONG,
                     request_id=frame.request_id,
                     payload=frame.payload,
                     flags=FrameFlags.IS_RESPONSE,
                 )
-                await conn.send(pong)
-            else:
-                log.warning("Неизвестный тип: %s", frame.msg_type)
-    except ConnectionClosed:
-        log.info("Соединение %s закрыто пиром", conn.connection_id)
-        raise
+            )
+        else:
+            log.warning(
+                "Неизвестный тип %s от %s",
+                frame.msg_type,
+                conn.connection_id,
+            )
+            await conn.send(
+                Frame(
+                    msg_type=MessageType.ERROR,
+                    request_id=frame.request_id,
+                    payload=f"unsupported type: {int(frame.msg_type)}".encode(),
+                    flags=FrameFlags.IS_RESPONSE | FrameFlags.IS_ERROR,
+                )
+            )
