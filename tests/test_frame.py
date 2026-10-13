@@ -1,5 +1,6 @@
 import struct
 import pytest
+import random
 
 from overlay.transport.frame import (
     HEADER_SIZE,
@@ -168,3 +169,31 @@ def test_buffer_buffered_bytes():
     buf = FrameBuffer()
     buf.feed(b"\x00\x01\x02")
     assert buf.buffered_bytes() == 3
+
+def test_stream_100_frames_random_split():
+    rng = random.Random(42)
+    frames = [
+        Frame(
+            msg_type=rng.choice(list(MessageType)),
+            request_id=bytes(rng.randrange(256) for _ in range(16)),
+            payload=bytes(rng.randrange(256) for _ in range(rng.randrange(0, 100))),
+        )
+        for _ in range(100)
+    ]
+    stream = b"".join(f.encode() for f in frames)
+
+    buf = FrameBuffer()
+    decoded: list[Frame] = []
+    pos = 0
+    while pos < len(stream):
+        chunk_size = rng.randrange(1, 200)
+        chunk = stream[pos : pos + chunk_size]
+        pos += chunk_size
+        decoded.extend(buf.feed(chunk))
+
+    assert len(decoded) == 100
+    for original, result in zip(frames, decoded):
+        assert original.msg_type == result.msg_type
+        assert original.request_id == result.request_id
+        assert original.payload == result.payload
+        assert original.version == result.version

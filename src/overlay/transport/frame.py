@@ -2,19 +2,18 @@ from __future__ import annotations
 
 import enum
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 PROTOCOL_VERSION: int = 1
 MAX_FRAME_PAYLOAD: int = 65_536
 
 HEADER_FORMAT = "!BBH16sI"
-HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # = 24
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 assert HEADER_SIZE == 24, f"Ожидалось 24 байта, получено {HEADER_SIZE}"
 
 
 class MessageType(enum.IntEnum):
-
     PING = 0x01
     PONG = 0x02
     FIND_NODE_REQUEST = 0x10
@@ -35,7 +34,6 @@ class MessageType(enum.IntEnum):
 
 
 class FrameFlags(enum.IntFlag):
-
     NONE = 0x0000
     IS_RESPONSE = 0x0001
     IS_ERROR = 0x0002
@@ -43,12 +41,11 @@ class FrameFlags(enum.IntFlag):
 
 
 class FrameError(Exception):
-    """Ошибка кадрирования. Соединение после неё обычно закрывается."""
+    pass
 
 
 @dataclass(slots=True)
 class Frame:
-
     msg_type: int
     request_id: bytes
     payload: bytes = b""
@@ -113,7 +110,6 @@ class Frame:
 
 
 class FrameBuffer:
-
     def __init__(self) -> None:
         self._buf = bytearray()
 
@@ -125,7 +121,7 @@ class FrameBuffer:
 
         while True:
             if len(self._buf) < HEADER_SIZE:
-                break  
+                break
 
             version, msg_type, flags, request_id, payload_length = struct.unpack(
                 HEADER_FORMAT, self._buf[:HEADER_SIZE]
@@ -140,7 +136,7 @@ class FrameBuffer:
 
             total = HEADER_SIZE + payload_length
             if len(self._buf) < total:
-                break  
+                break
 
             payload = bytes(self._buf[HEADER_SIZE:total])
             frames.append(
@@ -158,3 +154,11 @@ class FrameBuffer:
 
     def buffered_bytes(self) -> int:
         return len(self._buf)
+
+
+def configure(version: int | None = None, max_payload: int | None = None) -> None:
+    global PROTOCOL_VERSION, MAX_FRAME_PAYLOAD
+    if version is not None:
+        PROTOCOL_VERSION = version
+    if max_payload is not None:
+        MAX_FRAME_PAYLOAD = max_payload
