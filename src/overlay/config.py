@@ -24,7 +24,7 @@ class TransportConfig:
 class NodeConfig:
     host: str = "127.0.0.1"
     port: int = 9000
-
+    state_dir: str = "data/node-0"
 
 @dataclass(slots=True)
 class LoggingConfig:

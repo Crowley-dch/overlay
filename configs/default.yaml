@@ -9,6 +9,7 @@ transport:
 node:
   host: "127.0.0.1"
   port: 9000
+  state_dir: "data/node-0"
 
 logging:
   level: "INFO"
