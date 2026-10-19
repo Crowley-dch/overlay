@@ -33,6 +33,7 @@ class Server:
         self._handler = handler
         self._server: asyncio.Server | None = None
         self._tasks: set[asyncio.Task] = set()
+        self._connections: set[Connection] = set()
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(
@@ -50,6 +51,9 @@ class Server:
         if server is not None:
             server.close()
 
+        for conn in list(self._connections):
+            conn.close()
+
         if self._tasks:
             for task in list(self._tasks):
                 task.cancel()
@@ -59,14 +63,18 @@ class Server:
                     timeout=timeout,
                 )
             except asyncio.TimeoutError:
-                log.warning("Некоторые задачи не завершились за %ss", timeout)
+                log.warning(
+                    "Некоторые задачи не завершились за %ss", timeout
+                )
             self._tasks.clear()
 
         if server is not None:
             try:
                 await asyncio.wait_for(server.wait_closed(), timeout=timeout)
             except asyncio.TimeoutError:
-                log.warning("Server.wait_closed() не завершился за %ss", timeout)
+                log.warning(
+                    "Server.wait_closed() не завершился за %ss", timeout
+                )
 
     async def _on_client(
         self,
@@ -74,6 +82,7 @@ class Server:
         writer: asyncio.StreamWriter,
     ) -> None:
         conn = Connection.from_accepted(reader, writer)
+        self._connections.add(conn)
         task = asyncio.current_task()
         if task is not None:
             self._tasks.add(task)
@@ -95,6 +104,7 @@ class Server:
                 await asyncio.wait_for(conn.wait_closed(), timeout=1.0)
             except (asyncio.TimeoutError, Exception):
                 pass
+            self._connections.discard(conn)
             if task is not None:
                 self._tasks.discard(task)
 
