@@ -26,6 +26,20 @@ class NodeConfig:
     port: int = 9000
     state_dir: str = "data/node-0"
 
+
+@dataclass(slots=True)
+class DhtConfig:
+    k: int = 4
+    alpha: int = 3
+    replication_factor: int = 3
+
+
+@dataclass(slots=True)
+class BootstrapConfig:
+    scheme: str = "star"
+    n_nodes: int = 5
+
+
 @dataclass(slots=True)
 class LoggingConfig:
     level: str = "INFO"
@@ -37,6 +51,8 @@ class Config:
     protocol: ProtocolConfig = field(default_factory=ProtocolConfig)
     transport: TransportConfig = field(default_factory=TransportConfig)
     node: NodeConfig = field(default_factory=NodeConfig)
+    dht: DhtConfig = field(default_factory=DhtConfig)
+    bootstrap: BootstrapConfig = field(default_factory=BootstrapConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
 
@@ -60,5 +76,7 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
         protocol=_merge_dataclass(ProtocolConfig, raw.get("protocol")),
         transport=_merge_dataclass(TransportConfig, raw.get("transport")),
         node=_merge_dataclass(NodeConfig, raw.get("node")),
+        dht=_merge_dataclass(DhtConfig, raw.get("dht")),
+        bootstrap=_merge_dataclass(BootstrapConfig, raw.get("bootstrap")),
         logging=_merge_dataclass(LoggingConfig, raw.get("logging")),
     )

@@ -1,0 +1,25 @@
+protocol:
+  version: 1
+  max_frame_payload: 65536
+
+transport:
+  connect_timeout: 5.0
+  write_timeout: 5.0
+
+node:
+  host: "127.0.0.1"
+  port: 0
+  state_dir: "data/network"
+
+dht:
+  k: 4
+  alpha: 3
+  replication_factor: 3
+
+bootstrap:
+  scheme: "star"
+  n_nodes: 5
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s %(levelname)s %(name)s: %(message)s"
