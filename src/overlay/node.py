@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-
+import time
+import asyncio
 from overlay.config import Config
 from overlay.dht.contact import Contact
 from overlay.dht.lookup import IterativeLookup, LookupStats
@@ -63,7 +64,7 @@ class Node:
         self._config = config
         self._identity_store = IdentityStore(config.node.state_dir)
         self._identity = self._identity_store.load_or_create()
-
+        self._maintenance_task: asyncio.Task | None = None
         self._routing = ContactManager(
             self_id=self._identity.node_id,
             k=config.dht.k,
@@ -115,6 +116,7 @@ class Node:
 
     async def start(self) -> None:
         await self._server.start()
+        self._maintenance_task = asyncio.create_task(self._maintenance_loop())
         log.info(
             "Node %s слушает %s:%d",
             self._identity.node_id_hex[:12],
@@ -123,6 +125,13 @@ class Node:
         )
 
     async def stop(self) -> None:
+        if self._maintenance_task is not None:
+            self._maintenance_task.cancel()
+            try:
+                await self._maintenance_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._maintenance_task = None
         await self._server.stop()
 
     async def find_node(self, target: bytes, contact: Contact) -> list[Contact]:
@@ -485,6 +494,62 @@ class Node:
                     if cc.node_id not in pool and cc.node_id not in queried:
                         pool[cc.node_id] = cc
         return None
+    async def _maintenance_loop(self) -> None:
+        ttl_cfg = self._config.ttl
+        cleanup_interval = max(1, min(60, ttl_cfg.record_ttl // 3))
+        republish_interval = max(1, ttl_cfg.republish_interval)
+        tick = 0.5
+
+        last_cleanup = 0.0
+        last_republish = 0.0
+
+        try:
+            while True:
+                now = asyncio.get_running_loop().time()
+
+                if now - last_cleanup >= cleanup_interval:
+                    removed = self._store.cleanup()
+                    if removed:
+                        log.info(
+                            "cleanup: удалено %d истёкших записей", removed
+                        )
+                    last_cleanup = now
+
+                if now - last_republish >= republish_interval:
+                    await self._republish_own_records()
+                    last_republish = now
+
+                await asyncio.sleep(tick)
+        except asyncio.CancelledError:
+            raise
+    async def _republish_own_records(self) -> None:
+        now = int(time.time())
+        ttl = self._config.ttl.record_ttl
+
+        for key, record in self._store.items():
+            if record.node_id != self._identity.node_id:
+                continue
+            refreshed = NodeRecord(
+                node_id=record.node_id,
+                identity_public_key=record.identity_public_key,
+                addresses=list(record.addresses),
+                sequence_number=record.sequence_number + 1,
+                issued_at=now,
+                expires_at=now + ttl,
+                alias=record.alias,
+            )
+            refreshed.sign(self._identity.private_key)
+            try:
+                await self.put_record(refreshed)
+                log.info(
+                    "republish key=%s seq=%d",
+                    key.hex()[:12],
+                    refreshed.sequence_number,
+                )
+            except Exception as e:
+                log.warning(
+                    "republish key=%s: %s", key.hex()[:12], e
+                )
     async def _send_error(
         self, conn: Connection, frame: Frame, message: str
     ) -> None:
