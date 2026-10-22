@@ -16,6 +16,11 @@ dht:
   alpha: 3
   replication_factor: 3
 
+ttl:
+  record_ttl: 180
+  republish_interval: 80
+  max_record_size: 4096
+  
 bootstrap:
   scheme: "ring"
   n_nodes: 5

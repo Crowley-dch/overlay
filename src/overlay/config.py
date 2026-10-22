@@ -35,6 +35,13 @@ class DhtConfig:
 
 
 @dataclass(slots=True)
+class TtlConfig:
+    record_ttl: int = 180
+    republish_interval: int = 80
+    max_record_size: int = 4096
+
+
+@dataclass(slots=True)
 class BootstrapConfig:
     scheme: str = "star"
     n_nodes: int = 5
@@ -52,6 +59,7 @@ class Config:
     transport: TransportConfig = field(default_factory=TransportConfig)
     node: NodeConfig = field(default_factory=NodeConfig)
     dht: DhtConfig = field(default_factory=DhtConfig)
+    ttl: TtlConfig = field(default_factory=TtlConfig)
     bootstrap: BootstrapConfig = field(default_factory=BootstrapConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
@@ -77,6 +85,7 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
         transport=_merge_dataclass(TransportConfig, raw.get("transport")),
         node=_merge_dataclass(NodeConfig, raw.get("node")),
         dht=_merge_dataclass(DhtConfig, raw.get("dht")),
+        ttl=_merge_dataclass(TtlConfig, raw.get("ttl")),
         bootstrap=_merge_dataclass(BootstrapConfig, raw.get("bootstrap")),
         logging=_merge_dataclass(LoggingConfig, raw.get("logging")),
     )
