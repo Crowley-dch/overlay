@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+import secrets
 import asyncio
 from overlay.config import Config
 from overlay.dht.contact import Contact
@@ -57,13 +58,31 @@ from overlay.dht.wire import (
     encode_store_request,
     encode_store_response,
 )
-
+from overlay.tunnel import (
+    RelayState,
+    TunnelRoute,
+    TunnelState,
+    TunnelWireError,
+    decode_tunnel_build,
+    decode_tunnel_build_fail,
+    decode_tunnel_build_ok,
+    decode_tunnel_close,
+    decode_tunnel_data,
+    encode_tunnel_ack,
+    encode_tunnel_build,
+    encode_tunnel_build_fail,
+    encode_tunnel_build_ok,
+    encode_tunnel_close,
+    encode_tunnel_data,
+)
 log = logging.getLogger(__name__)
 
 
 class Node:
     def __init__(self, config: Config) -> None:
         self._config = config
+        self._tunnel_routes: dict[bytes, TunnelRoute] = {}
+        self._relay_states: dict[bytes, RelayState] = {}
         self._identity_store = IdentityStore(config.node.state_dir)
         self._identity = self._identity_store.load_or_create()
         self._maintenance_task: asyncio.Task | None = None
@@ -283,8 +302,10 @@ class Node:
             MessageType.FIND_NODE_REQUEST: self._on_find_node,
             MessageType.STORE_REQUEST: self._on_store,
             MessageType.FIND_VALUE_REQUEST: self._on_find_value,
+            MessageType.TUNNEL_BUILD: self._on_tunnel_build,
+            MessageType.TUNNEL_DATA: self._on_tunnel_data,
+            MessageType.TUNNEL_CLOSE: self._on_tunnel_close,
         }.get(MessageType(frame.msg_type))
-
         if handler is None:
             await self._send_error(
                 conn, frame, f"unsupported type: {int(frame.msg_type)}"
@@ -596,3 +617,337 @@ class Node:
                 flags=FrameFlags.IS_RESPONSE | FrameFlags.IS_ERROR,
             )
         )
+    def _select_relays(
+        self, destination: Contact, count: int
+    ) -> list[Contact]:
+        candidates = [
+            c
+            for c in self._routing.routing.all_contacts()
+            if c.node_id != self._identity.node_id
+            and c.node_id != destination.node_id
+        ]
+        return candidates[:count]
+
+    async def _send_tunnel_build(
+        self,
+        target: Contact,
+        tunnel_id: bytes,
+        prev_hop: Contact | None,
+        next_hop: Contact | None,
+        max_hops: int,
+        ttl: int,
+    ) -> bool:
+        try:
+            secure = await SecureConnection.initiate(
+                target.host,
+                target.port,
+                self._identity,
+                connect_timeout=self._config.transport.connect_timeout,
+            )
+        except (
+            ConnectionTimeout,
+            ConnectionClosed,
+            SecureConnectionError,
+            OSError,
+        ):
+            return False
+        try:
+            rpc = RpcClient(
+                secure,
+                default_timeout=self._config.transport.connect_timeout,
+            )
+            await rpc.start()
+            try:
+                response = await rpc.request(
+                    MessageType.TUNNEL_BUILD,
+                    payload=encode_tunnel_build(
+                        tunnel_id,
+                        prev_hop=prev_hop,
+                        next_hop=next_hop,
+                        max_hops=max_hops,
+                        ttl=ttl,
+                    ),
+                    expected_response_types={
+                        MessageType.TUNNEL_BUILD_OK,
+                        MessageType.TUNNEL_BUILD_FAIL,
+                    },
+                )
+                if response.msg_type == MessageType.TUNNEL_BUILD_OK:
+                    return True
+                return False
+            except (RequestTimeout, ConnectionBroken):
+                return False
+            finally:
+                await rpc.stop()
+        finally:
+            secure.close()
+            await secure.wait_closed()
+
+    async def build_tunnel(
+        self,
+        destination: Contact,
+        relay_count: int = 3,
+        ttl: int = 300,
+    ) -> TunnelRoute:
+        if relay_count < 1:
+            raise ValueError("нужен хотя бы один ретранслятор")
+        relays = self._select_relays(destination, relay_count)
+        if len(relays) < relay_count:
+            raise RuntimeError(
+                f"недостаточно ретрансляторов: {len(relays)} < {relay_count}"
+            )
+        tunnel_id = secrets.token_bytes(16)
+        hops = [self.self_contact()] + relays + [destination]
+        route = TunnelRoute(
+            tunnel_id=tunnel_id,
+            hops=hops,
+            state=TunnelState.BUILDING,
+            max_hops=len(hops),
+            expires_at=time.time() + ttl,
+        )
+
+        build_tasks = []
+        for i in range(1, len(hops)):
+            hop = hops[i]
+            prev_hop = hops[i - 1]
+            next_hop = hops[i + 1] if i + 1 < len(hops) else None
+            build_tasks.append(
+                self._send_tunnel_build(
+                    hop, tunnel_id, prev_hop, next_hop, len(hops), ttl
+                )
+            )
+        results = await asyncio.gather(*build_tasks, return_exceptions=True)
+        ok_count = sum(1 for r in results if r is True)
+
+        if ok_count == len(hops) - 1:
+            route.state = TunnelState.ACTIVE
+            self._tunnel_routes[tunnel_id] = route
+            log.info(
+                "Туннель %s построен: %d ретрансляторов",
+                tunnel_id.hex()[:12],
+                route.relay_count,
+            )
+        else:
+            route.state = TunnelState.DEAD
+            await self._send_tunnel_close_to_hops(hops[1:], tunnel_id)
+            log.warning(
+                "Туннель %s не построен: %d/%d подтверждений",
+                tunnel_id.hex()[:12],
+                ok_count,
+                len(hops) - 1,
+            )
+        return route
+
+    async def _send_tunnel_close_to_hops(
+        self, hops: list[Contact], tunnel_id: bytes
+    ) -> None:
+        for hop in hops:
+            try:
+                secure = await SecureConnection.initiate(
+                    hop.host,
+                    hop.port,
+                    self._identity,
+                    connect_timeout=self._config.transport.connect_timeout,
+                )
+            except Exception:
+                continue
+            try:
+                await secure.send(
+                    Frame(
+                        msg_type=MessageType.TUNNEL_CLOSE,
+                        request_id=secrets.token_bytes(16),
+                        payload=encode_tunnel_close(tunnel_id),
+                    )
+                )
+            except Exception:
+                pass
+            finally:
+                secure.close()
+                await secure.wait_closed()
+
+    async def send_via_tunnel(
+        self,
+        tunnel_id: bytes,
+        payload: bytes,
+        *,
+        timeout: float = 30.0,
+    ) -> bytes:
+        route = self._tunnel_routes.get(tunnel_id)
+        if route is None:
+            raise RuntimeError("Неизвестный tunnel_id")
+        if route.state != TunnelState.ACTIVE:
+            raise RuntimeError(f"Туннель в состоянии {route.state.value}")
+
+        message_id = secrets.token_bytes(16)
+        first_relay = route.hops[1]
+
+        secure = await SecureConnection.initiate(
+            first_relay.host,
+            first_relay.port,
+            self._identity,
+            connect_timeout=self._config.transport.connect_timeout,
+        )
+        try:
+            rpc = RpcClient(secure, default_timeout=timeout)
+            await rpc.start()
+            try:
+                response = await rpc.request(
+                    MessageType.TUNNEL_DATA,
+                    payload=encode_tunnel_data(
+                        tunnel_id, message_id, payload
+                    ),
+                    expected_response_types={MessageType.TUNNEL_ACK},
+                )
+                ack_tunnel_id, ack_message_id, ack_payload = decode_tunnel_data(
+                    response.payload
+                )
+                if ack_tunnel_id != tunnel_id:
+                    raise RuntimeError("ACK с чужим tunnel_id")
+                if ack_message_id != message_id:
+                    raise RuntimeError("ACK с чужим message_id")
+                return ack_payload
+            finally:
+                await rpc.stop()
+        finally:
+            secure.close()
+            await secure.wait_closed()
+
+    async def close_tunnel(self, tunnel_id: bytes) -> None:
+        route = self._tunnel_routes.pop(tunnel_id, None)
+        if route is None:
+            return
+        route.state = TunnelState.CLOSING
+        await self._send_tunnel_close_to_hops(route.hops[1:], tunnel_id)
+        route.state = TunnelState.DEAD
+
+    async def _on_tunnel_build(
+        self, conn: TransportLike, frame: Frame
+    ) -> None:
+        try:
+            data = decode_tunnel_build(frame.payload)
+        except TunnelWireError as e:
+            await self._send_error(conn, frame, str(e))
+            return
+        tunnel_id = data["tunnel_id"]
+        if tunnel_id in self._relay_states:
+            await conn.send(
+                Frame(
+                    msg_type=MessageType.TUNNEL_BUILD_FAIL,
+                    request_id=frame.request_id,
+                    payload=encode_tunnel_build_fail(
+                        tunnel_id, "duplicate tunnel_id"
+                    ),
+                    flags=FrameFlags.IS_RESPONSE,
+                )
+            )
+            return
+        self._relay_states[tunnel_id] = RelayState(
+            tunnel_id=tunnel_id,
+            prev_hop=data["prev_hop"],
+            next_hop=data["next_hop"],
+            max_hops=data["max_hops"],
+            expires_at=time.time() + data["ttl"],
+        )
+        log.info(
+            "Relay %s: tunnel %s accepted (prev=%s, next=%s)",
+            self._identity.node_id_hex[:12],
+            tunnel_id.hex()[:12],
+            data["prev_hop"].node_id_hex[:8] if data["prev_hop"] else None,
+            data["next_hop"].node_id_hex[:8] if data["next_hop"] else None,
+        )
+        await conn.send(
+            Frame(
+                msg_type=MessageType.TUNNEL_BUILD_OK,
+                request_id=frame.request_id,
+                payload=encode_tunnel_build_ok(tunnel_id),
+                flags=FrameFlags.IS_RESPONSE,
+            )
+        )
+
+    async def _on_tunnel_data(
+        self, conn: TransportLike, frame: Frame
+    ) -> None:
+        try:
+            tunnel_id, message_id, payload = decode_tunnel_data(
+                frame.payload
+            )
+        except TunnelWireError as e:
+            await self._send_error(conn, frame, str(e))
+            return
+
+        relay = self._relay_states.get(tunnel_id)
+        if relay is None:
+            await self._send_error(
+                conn, frame, "unknown tunnel_id"
+            )
+            return
+
+        if relay.is_destination:
+            response_payload = b"delivered:" + payload[:16]
+            await conn.send(
+                Frame(
+                    msg_type=MessageType.TUNNEL_ACK,
+                    request_id=frame.request_id,
+                    payload=encode_tunnel_ack(
+                        tunnel_id, message_id, response_payload
+                    ),
+                    flags=FrameFlags.IS_RESPONSE,
+                )
+            )
+            return
+
+        next_hop = relay.next_hop
+        assert next_hop is not None
+        try:
+            secure = await SecureConnection.initiate(
+                next_hop.host,
+                next_hop.port,
+                self._identity,
+                connect_timeout=self._config.transport.connect_timeout,
+            )
+        except Exception as e:
+            await self._send_error(
+                conn, frame, f"relay to {next_hop.node_id_hex[:8]}: {e}"
+            )
+            return
+        try:
+            rpc = RpcClient(
+                secure, default_timeout=self._config.transport.connect_timeout
+            )
+            await rpc.start()
+            try:
+                response = await rpc.request(
+                    MessageType.TUNNEL_DATA,
+                    payload=encode_tunnel_data(
+                        tunnel_id, message_id, payload
+                    ),
+                    expected_response_types={MessageType.TUNNEL_ACK},
+                )
+                await conn.send(
+                    Frame(
+                        msg_type=MessageType.TUNNEL_ACK,
+                        request_id=frame.request_id,
+                        payload=response.payload,
+                        flags=FrameFlags.IS_RESPONSE,
+                    )
+                )
+            except (RequestTimeout, ConnectionBroken) as e:
+                await self._send_error(conn, frame, f"relay: {e}")
+            finally:
+                await rpc.stop()
+        finally:
+            secure.close()
+            await secure.wait_closed()
+
+    async def _on_tunnel_close(
+        self, conn: TransportLike, frame: Frame
+    ) -> None:
+        try:
+            tunnel_id = decode_tunnel_close(frame.payload)
+        except TunnelWireError:
+            return
+        relay = self._relay_states.pop(tunnel_id, None)
+        route = self._tunnel_routes.pop(tunnel_id, None)
+        if relay is None and route is None:
+            return
+        log.info("Tunnel %s closed", tunnel_id.hex()[:12])
