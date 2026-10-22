@@ -184,20 +184,22 @@ def test_find_node_respects_k(tmp_path: Path):
     _run(scenario())
 
 
-def test_find_node_rejects_bad_request(tmp_path: Path):
+def test_secure_find_node_rejects_bad_request(tmp_path: Path):
     async def scenario():
         a = Node(_config(tmp_path / "a"))
         b = Node(_config(tmp_path / "b"))
         await a.start()
         await b.start()
         try:
-            from overlay.transport.connection import Connection
-            from overlay.transport.frame import Frame, MessageType
+            from overlay.transport.frame import MessageType
             from overlay.transport.rpc import RequestTimeout, RpcClient
+            from overlay.transport.secure import SecureConnection
 
-            conn = await Connection.connect(b.host, b.port, connect_timeout=1.0)
+            secure = await SecureConnection.initiate(
+                b.host, b.port, a.identity, connect_timeout=1.0
+            )
             try:
-                rpc = RpcClient(conn, default_timeout=1.0)
+                rpc = RpcClient(secure, default_timeout=1.0)
                 await rpc.start()
                 try:
                     try:
@@ -215,8 +217,8 @@ def test_find_node_rejects_bad_request(tmp_path: Path):
                 finally:
                     await rpc.stop()
             finally:
-                conn.close()
-                await conn.wait_closed()
+                secure.close()
+                await secure.wait_closed()
         finally:
             await a.stop()
             await b.stop()

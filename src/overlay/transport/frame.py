@@ -30,6 +30,10 @@ class MessageType(enum.IntEnum):
     TUNNEL_CLOSE = 0x52
     APP_MESSAGE = 0x60
     APP_ACK = 0x61
+    HANDSHAKE_INIT = 0x70
+    HANDSHAKE_ACK = 0x71
+    HANDSHAKE_FINISH = 0x72
+    SECURE_FRAME = 0x73
     ERROR = 0xFF
 
 

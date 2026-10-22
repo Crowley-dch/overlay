@@ -14,6 +14,8 @@ from overlay.dht.wire import (
     encode_find_node_request,
     encode_find_node_response,
 )
+from overlay.transport.secure import SecureConnection, SecureConnectionError
+from overlay.transport.types import TransportLike
 from overlay.identity import Identity, IdentityStore
 from overlay.transport.connection import (
     Connection,
@@ -70,6 +72,7 @@ class Node:
             k=config.dht.k,
             connect_timeout=config.transport.connect_timeout,
             ping_timeout=config.transport.connect_timeout,
+            ping_fn=self.ping,
         )
 
         self._server = Server(
@@ -135,14 +138,15 @@ class Node:
         await self._server.stop()
 
     async def find_node(self, target: bytes, contact: Contact) -> list[Contact]:
-        conn = await Connection.connect(
+        secure = await SecureConnection.initiate(
             contact.host,
             contact.port,
+            self._identity,
             connect_timeout=self._config.transport.connect_timeout,
         )
         try:
             rpc = RpcClient(
-                conn,
+                secure,
                 default_timeout=self._config.transport.connect_timeout,
             )
             await rpc.start()
@@ -160,8 +164,8 @@ class Node:
             finally:
                 await rpc.stop()
         finally:
-            conn.close()
-            await conn.wait_closed()
+            secure.close()
+            await secure.wait_closed()
     async def _find_node_rpc(
         self, contact: Contact, target: bytes
     ) -> list[Contact]:
@@ -207,16 +211,22 @@ class Node:
         return result
     async def ping(self, contact: Contact) -> bool:
         try:
-            conn = await Connection.connect(
+            secure = await SecureConnection.initiate(
                 contact.host,
                 contact.port,
+                self._identity,
                 connect_timeout=self._config.transport.connect_timeout,
             )
-        except (ConnectionTimeout, ConnectionClosed, OSError):
+        except (
+            ConnectionTimeout,
+            ConnectionClosed,
+            SecureConnectionError,
+            OSError,
+        ):
             return False
         try:
             rpc = RpcClient(
-                conn,
+                secure,
                 default_timeout=self._config.transport.connect_timeout,
             )
             await rpc.start()
@@ -231,29 +241,50 @@ class Node:
             finally:
                 await rpc.stop()
         finally:
-            conn.close()
-            await conn.wait_closed()
+            secure.close()
+            await secure.wait_closed()
 
     async def _handle_connection(self, conn: Connection) -> None:
-        while True:
+        try:
+            secure = await SecureConnection.accept(conn, self._identity)
+        except Exception as e:
+            log.warning(
+                "Handshake failed from %s:%d: %s",
+                conn.peer_host,
+                conn.peer_port,
+                e,
+            )
+            conn.close()
             try:
-                frame = await conn.recv()
-            except ConnectionClosed:
-                raise
-            except FrameError as e:
-                log.warning(
-                    "Кадрирование от %s: %s", conn.connection_id, e
-                )
-                raise
-            await self._dispatch(conn, frame)
-
-    async def _dispatch(self, conn: Connection, frame: Frame) -> None:
+                await conn.wait_closed()
+            except Exception:
+                pass
+            raise
+        try:
+            while True:
+                try:
+                    frame = await secure.recv()
+                except ConnectionClosed:
+                    raise
+                except FrameError as e:
+                    log.warning(
+                        "Кадрирование от %s: %s", conn.connection_id, e
+                    )
+                    raise
+                await self._dispatch(secure, frame)
+        finally:
+            secure.close()
+            await secure.wait_closed()
+    async def _dispatch(
+        self, conn: TransportLike, frame: Frame
+    ) -> None:
         handler = {
             MessageType.PING: self._on_ping,
             MessageType.FIND_NODE_REQUEST: self._on_find_node,
             MessageType.STORE_REQUEST: self._on_store,
             MessageType.FIND_VALUE_REQUEST: self._on_find_value,
         }.get(MessageType(frame.msg_type))
+
         if handler is None:
             await self._send_error(
                 conn, frame, f"unsupported type: {int(frame.msg_type)}"
@@ -263,10 +294,13 @@ class Node:
         try:
             await handler(conn, frame)
         except WireError as e:
-            log.warning("Wire error from %s: %s", conn.connection_id, e)
+            log.warning(
+                "Wire error from %s: %s", conn.connection_id, e
+            )
             await self._send_error(conn, frame, str(e))
-
-    async def _on_ping(self, conn: Connection, frame: Frame) -> None:
+    async def _on_ping(
+        self, conn: TransportLike, frame: Frame
+    ) -> None:
         await conn.send(
             Frame(
                 msg_type=MessageType.PONG,
@@ -276,7 +310,9 @@ class Node:
             )
         )
 
-    async def _on_find_node(self, conn: Connection, frame: Frame) -> None:
+    async def _on_find_node(
+        self, conn: TransportLike, frame: Frame
+    ) -> None:
         target, sender = decode_find_node_request(frame.payload)
         if sender.node_id != self._identity.node_id:
             try:
@@ -292,7 +328,9 @@ class Node:
                 flags=FrameFlags.IS_RESPONSE,
             )
         )
-    async def _on_store(self, conn: Connection, frame: Frame) -> None:
+    async def _on_store(
+        self, conn: TransportLike, frame: Frame
+    ) -> None:
         try:
             key, record_json = decode_store_request(frame.payload)
             record = NodeRecord._from_dict(record_json)
@@ -316,7 +354,9 @@ class Node:
             )
         )
 
-    async def _on_find_value(self, conn: Connection, frame: Frame) -> None:
+    async def _on_find_value(
+        self, conn: TransportLike, frame: Frame
+    ) -> None:
         try:
             key = decode_find_value_request(frame.payload)
         except WireError as e:
@@ -324,38 +364,31 @@ class Node:
             return
         record = self._store.get(key)
         contacts = self._routing.routing.closest(key, self._routing.k)
-        if record is not None:
-            await conn.send(
-                Frame(
-                    msg_type=MessageType.FIND_VALUE_RESPONSE,
-                    request_id=frame.request_id,
-                    payload=encode_find_value_response(
-                        record.to_dict(), contacts
-                    ),
-                    flags=FrameFlags.IS_RESPONSE,
-                )
+        await conn.send(
+            Frame(
+                msg_type=MessageType.FIND_VALUE_RESPONSE,
+                request_id=frame.request_id,
+                payload=encode_find_value_response(
+                    record.to_dict() if record is not None else None,
+                    contacts,
+                ),
+                flags=FrameFlags.IS_RESPONSE,
             )
-        else:
-            await conn.send(
-                Frame(
-                    msg_type=MessageType.FIND_VALUE_RESPONSE,
-                    request_id=frame.request_id,
-                    payload=encode_find_value_response(None, contacts),
-                    flags=FrameFlags.IS_RESPONSE,
-                )
-            )
+        )
 
     async def _store_rpc(
         self, contact: Contact, key: bytes, record: NodeRecord
     ) -> bool:
-        conn = await Connection.connect(
+        secure = await SecureConnection.initiate(
             contact.host,
             contact.port,
+            self._identity,
             connect_timeout=self._config.transport.connect_timeout,
         )
         try:
             rpc = RpcClient(
-                conn, default_timeout=self._config.transport.connect_timeout
+                secure,
+                default_timeout=self._config.transport.connect_timeout,
             )
             await rpc.start()
             try:
@@ -369,20 +402,22 @@ class Node:
             finally:
                 await rpc.stop()
         finally:
-            conn.close()
-            await conn.wait_closed()
+            secure.close()
+            await secure.wait_closed()
 
     async def _find_value_rpc(
         self, contact: Contact, key: bytes
     ) -> tuple[NodeRecord | None, list[Contact]]:
-        conn = await Connection.connect(
+        secure = await SecureConnection.initiate(
             contact.host,
             contact.port,
+            self._identity,
             connect_timeout=self._config.transport.connect_timeout,
         )
         try:
             rpc = RpcClient(
-                conn, default_timeout=self._config.transport.connect_timeout
+                secure,
+                default_timeout=self._config.transport.connect_timeout,
             )
             await rpc.start()
             try:
@@ -405,8 +440,8 @@ class Node:
             finally:
                 await rpc.stop()
         finally:
-            conn.close()
-            await conn.wait_closed()
+            secure.close()
+            await secure.wait_closed()
 
     async def put_record(
         self,
@@ -551,7 +586,7 @@ class Node:
                     "republish key=%s: %s", key.hex()[:12], e
                 )
     async def _send_error(
-        self, conn: Connection, frame: Frame, message: str
+        self, conn: TransportLike, frame: Frame, message: str
     ) -> None:
         await conn.send(
             Frame(
