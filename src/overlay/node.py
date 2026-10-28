@@ -90,6 +90,7 @@ class Node:
     def __init__(self, config: Config) -> None:
         self._config = config
         self._e2e_sessions: dict[bytes, SecureSession] = {}
+        self._failed_relays: dict[bytes, float] = {}
         self._e2e_pending: dict[bytes, ResponderHandshake] = {}
         self._tunnel_routes: dict[bytes, TunnelRoute] = {}
         self._relay_states: dict[bytes, RelayState] = {}
@@ -628,16 +629,43 @@ class Node:
             )
         )
     def _select_relays(
-        self, destination: Contact, count: int
+        self,
+        destination: Contact,
+        count: int,
+        exclude: set[bytes] | None = None,
     ) -> list[Contact]:
+        now = time.time()
+        exclude = exclude or set()
         candidates = [
             c
             for c in self._routing.routing.all_contacts()
             if c.node_id != self._identity.node_id
             and c.node_id != destination.node_id
+            and c.node_id not in exclude
+            and self._failed_relays.get(c.node_id, 0.0) < now
         ]
         return candidates[:count]
 
+    def mark_relays_failed(self, node_ids: list[bytes]) -> None:
+        deadline = time.time() + 60.0
+        for nid in node_ids:
+            self._failed_relays[nid] = deadline
+            log.warning(
+                "Ретранслятор %s помечен сбойным до %.0f",
+                nid.hex()[:12],
+                deadline,
+            )
+
+    async def detect_failed_relays(self, tunnel_id: bytes) -> list[bytes]:
+        route = self._tunnel_routes.get(tunnel_id)
+        if route is None:
+            return []
+        failed: list[bytes] = []
+        for relay in route.relays:
+            alive = await self.ping(relay)
+            if not alive:
+                failed.append(relay.node_id)
+        return failed
     async def _send_tunnel_build(
         self,
         target: Contact,
@@ -698,10 +726,13 @@ class Node:
         destination: Contact,
         relay_count: int = 3,
         ttl: int = 300,
+        exclude: set[bytes] | None = None,
     ) -> TunnelRoute:
         if relay_count < 1:
             raise ValueError("нужен хотя бы один ретранслятор")
-        relays = self._select_relays(destination, relay_count)
+        relays = self._select_relays(
+            destination, relay_count, exclude=exclude
+        )
         if len(relays) < relay_count:
             raise RuntimeError(
                 f"недостаточно ретрансляторов: {len(relays)} < {relay_count}"
@@ -747,7 +778,6 @@ class Node:
                 len(hops) - 1,
             )
         return route
-
     async def _send_tunnel_close_to_hops(
         self, hops: list[Contact], tunnel_id: bytes
     ) -> None:
@@ -1060,9 +1090,10 @@ class Node:
         self,
         destination: Contact,
         relay_count: int = 3,
+        exclude: set[bytes] | None = None,
     ) -> SecureTunnel:
         route = await self.build_tunnel(
-            destination, relay_count=relay_count
+            destination, relay_count=relay_count, exclude=exclude
         )
         if route.state != TunnelState.ACTIVE:
             raise RuntimeError(
@@ -1109,9 +1140,12 @@ class Node:
         )
 
         return SecureTunnel(
-            self, route.tunnel_id, destination, initiator.session
+            self,
+            route.tunnel_id,
+            destination,
+            initiator.session,
+            relay_count,
         )
-
     async def close_secure_tunnel(self, secure: SecureTunnel) -> None:
         secure.close()
         self._e2e_sessions.pop(secure.tunnel_id, None)

@@ -189,3 +189,38 @@ def test_e2e_rejects_plaintext_in_encrypted_frame(tmp_path: Path):
             await _stop_network(nodes)
 
     _run(scenario())
+
+def test_recovery_after_relay_failure(tmp_path: Path):
+    async def scenario():
+        nodes = await _start_network(tmp_path, 6)
+        a, target = nodes[0], nodes[-1]
+        stopped: list[Node] = []
+        try:
+            secure_tunnel = await a.open_secure_tunnel(
+                target.self_contact(), relay_count=3
+            )
+            old_tunnel_id = secure_tunnel.tunnel_id
+            old_session_id = secure_tunnel.session_id
+
+            route = a._tunnel_routes[old_tunnel_id]
+            relay_to_kill = route.relays[1]
+            relay_node = next(
+                n for n in nodes if n.node_id == relay_to_kill.node_id
+            )
+            await relay_node.stop()
+            stopped.append(relay_node)
+
+            response = await secure_tunnel.send_message(b"after-recovery")
+            assert response == b"delivered:after-recovery"
+            assert secure_tunnel.tunnel_id != old_tunnel_id
+            assert secure_tunnel.session_id != old_session_id
+        finally:
+            for node in nodes:
+                if node in stopped:
+                    continue
+                try:
+                    await node.stop()
+                except Exception:
+                    pass
+
+    _run(scenario())
