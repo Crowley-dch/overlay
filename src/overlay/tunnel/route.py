@@ -83,6 +83,7 @@ class RelayState:
     next_hop: Contact | None
     max_hops: int
     expires_at: float
+    seen_message_ids: set[bytes] = field(default_factory=set)
 
     def is_expired(self, now: float | None = None) -> bool:
         current = time.time() if now is None else now
@@ -91,3 +92,13 @@ class RelayState:
     @property
     def is_destination(self) -> bool:
         return self.next_hop is None
+
+    def was_seen(self, message_id: bytes) -> bool:
+        if message_id in self.seen_message_ids:
+            return True
+        self.seen_message_ids.add(message_id)
+        if len(self.seen_message_ids) > 4096:
+            self.seen_message_ids = set(
+                list(self.seen_message_ids)[-2048:]
+            )
+        return False

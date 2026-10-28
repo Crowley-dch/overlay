@@ -137,7 +137,7 @@ def test_wire_tunnel_data_roundtrip():
     message_id = secrets.token_bytes(16)
     payload = b"hello world"
     raw = encode_tunnel_data(tunnel_id, message_id, payload)
-    tid, mid, p = decode_tunnel_data(raw)
+    tid, mid, p, enc = decode_tunnel_data(raw)
     assert tid == tunnel_id
     assert mid == message_id
     assert p == payload

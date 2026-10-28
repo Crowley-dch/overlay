@@ -138,6 +138,8 @@ def encode_tunnel_data(
     tunnel_id: bytes,
     message_id: bytes,
     payload: bytes,
+    *,
+    encrypted: bool = False,
 ) -> bytes:
     if len(message_id) != 16:
         raise TunnelWireError("message_id должен быть 16 байт")
@@ -145,6 +147,7 @@ def encode_tunnel_data(
         {
             "tunnel_id": _tunnel_id_hex(tunnel_id),
             "message_id": message_id.hex(),
+            "encrypted": bool(encrypted),
             "payload": payload.hex(),
         },
         separators=(",", ":"),
@@ -152,27 +155,32 @@ def encode_tunnel_data(
     ).encode("utf-8")
 
 
-def decode_tunnel_data(payload: bytes) -> tuple[bytes, bytes, bytes]:
+def decode_tunnel_data(payload: bytes) -> tuple[bytes, bytes, bytes, bool]:
     data = _loads(payload, "TUNNEL_DATA")
     tunnel_id = _parse_tunnel_id(data.get("tunnel_id"))
     message_hex = data.get("message_id")
     payload_hex = data.get("payload")
+    encrypted = data.get("encrypted", False)
     if not isinstance(message_hex, str) or len(message_hex) != 32:
         raise TunnelWireError("message_id должен быть hex из 32 символов")
     if not isinstance(payload_hex, str):
         raise TunnelWireError("payload должен быть hex-строкой")
+    if not isinstance(encrypted, bool):
+        raise TunnelWireError("encrypted должен быть bool")
     try:
         message_id = bytes.fromhex(message_hex)
         inner = bytes.fromhex(payload_hex)
     except ValueError as e:
         raise TunnelWireError(f"hex-поле некорректно: {e}") from e
-    return tunnel_id, message_id, inner
+    return tunnel_id, message_id, inner, encrypted
 
 
 def encode_tunnel_ack(
     tunnel_id: bytes,
     message_id: bytes,
     payload: bytes,
+    *,
+    encrypted: bool = False,
 ) -> bytes:
     if len(message_id) != 16:
         raise TunnelWireError("message_id должен быть 16 байт")
@@ -180,6 +188,7 @@ def encode_tunnel_ack(
         {
             "tunnel_id": _tunnel_id_hex(tunnel_id),
             "message_id": message_id.hex(),
+            "encrypted": bool(encrypted),
             "payload": payload.hex(),
         },
         separators=(",", ":"),
@@ -187,10 +196,8 @@ def encode_tunnel_ack(
     ).encode("utf-8")
 
 
-def decode_tunnel_ack(payload: bytes) -> tuple[bytes, bytes, bytes]:
+def decode_tunnel_ack(payload: bytes) -> tuple[bytes, bytes, bytes, bool]:
     return decode_tunnel_data(payload)
-
-
 def encode_tunnel_close(tunnel_id: bytes) -> bytes:
     return json.dumps(
         {"tunnel_id": _tunnel_id_hex(tunnel_id)},

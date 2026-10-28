@@ -42,6 +42,11 @@ from overlay.dht.record import (
     record_key_for_alias,
     record_key_for_node,
 )
+from overlay.crypto.handshake import (
+    InitiatorHandshake,
+    ResponderHandshake,
+    SecureSession,
+)
 from overlay.dht.store import RecordConflict, RecordStore
 from overlay.dht.wire import (
     WireError,
@@ -60,9 +65,12 @@ from overlay.dht.wire import (
 )
 from overlay.tunnel import (
     RelayState,
+    SecureTunnel,
+    SecureTunnelError,
     TunnelRoute,
     TunnelState,
     TunnelWireError,
+    decode_tunnel_ack,
     decode_tunnel_build,
     decode_tunnel_build_fail,
     decode_tunnel_build_ok,
@@ -81,6 +89,8 @@ log = logging.getLogger(__name__)
 class Node:
     def __init__(self, config: Config) -> None:
         self._config = config
+        self._e2e_sessions: dict[bytes, SecureSession] = {}
+        self._e2e_pending: dict[bytes, ResponderHandshake] = {}
         self._tunnel_routes: dict[bytes, TunnelRoute] = {}
         self._relay_states: dict[bytes, RelayState] = {}
         self._identity_store = IdentityStore(config.node.state_dir)
@@ -770,6 +780,7 @@ class Node:
         tunnel_id: bytes,
         payload: bytes,
         *,
+        encrypted: bool = False,
         timeout: float = 30.0,
     ) -> bytes:
         route = self._tunnel_routes.get(tunnel_id)
@@ -794,13 +805,16 @@ class Node:
                 response = await rpc.request(
                     MessageType.TUNNEL_DATA,
                     payload=encode_tunnel_data(
-                        tunnel_id, message_id, payload
+                        tunnel_id, message_id, payload, encrypted=encrypted
                     ),
                     expected_response_types={MessageType.TUNNEL_ACK},
                 )
-                ack_tunnel_id, ack_message_id, ack_payload = decode_tunnel_data(
-                    response.payload
-                )
+                (
+                    ack_tunnel_id,
+                    ack_message_id,
+                    ack_payload,
+                    _,
+                ) = decode_tunnel_ack(response.payload)
                 if ack_tunnel_id != tunnel_id:
                     raise RuntimeError("ACK с чужим tunnel_id")
                 if ack_message_id != message_id:
@@ -868,7 +882,7 @@ class Node:
         self, conn: TransportLike, frame: Frame
     ) -> None:
         try:
-            tunnel_id, message_id, payload = decode_tunnel_data(
+            tunnel_id, message_id, payload, encrypted = decode_tunnel_data(
                 frame.payload
             )
         except TunnelWireError as e:
@@ -877,19 +891,35 @@ class Node:
 
         relay = self._relay_states.get(tunnel_id)
         if relay is None:
-            await self._send_error(
-                conn, frame, "unknown tunnel_id"
-            )
+            await self._send_error(conn, frame, "unknown tunnel_id")
             return
 
-        if relay.is_destination:
-            response_payload = b"delivered:" + payload[:16]
+        if relay.was_seen(message_id):
             await conn.send(
                 Frame(
                     msg_type=MessageType.TUNNEL_ACK,
                     request_id=frame.request_id,
                     payload=encode_tunnel_ack(
-                        tunnel_id, message_id, response_payload
+                        tunnel_id, message_id, b"", encrypted=False
+                    ),
+                    flags=FrameFlags.IS_RESPONSE,
+                )
+            )
+            return
+
+        if relay.is_destination:
+            response_payload = await self._handle_e2e_data(
+                tunnel_id, payload, encrypted
+            )
+            await conn.send(
+                Frame(
+                    msg_type=MessageType.TUNNEL_ACK,
+                    request_id=frame.request_id,
+                    payload=encode_tunnel_ack(
+                        tunnel_id,
+                        message_id,
+                        response_payload,
+                        encrypted=encrypted,
                     ),
                     flags=FrameFlags.IS_RESPONSE,
                 )
@@ -912,14 +942,18 @@ class Node:
             return
         try:
             rpc = RpcClient(
-                secure, default_timeout=self._config.transport.connect_timeout
+                secure,
+                default_timeout=self._config.transport.connect_timeout,
             )
             await rpc.start()
             try:
                 response = await rpc.request(
                     MessageType.TUNNEL_DATA,
                     payload=encode_tunnel_data(
-                        tunnel_id, message_id, payload
+                        tunnel_id,
+                        message_id,
+                        payload,
+                        encrypted=encrypted,
                     ),
                     expected_response_types={MessageType.TUNNEL_ACK},
                 )
@@ -946,8 +980,140 @@ class Node:
             tunnel_id = decode_tunnel_close(frame.payload)
         except TunnelWireError:
             return
-        relay = self._relay_states.pop(tunnel_id, None)
-        route = self._tunnel_routes.pop(tunnel_id, None)
-        if relay is None and route is None:
-            return
+        self._relay_states.pop(tunnel_id, None)
+        self._tunnel_routes.pop(tunnel_id, None)
+        self._e2e_sessions.pop(tunnel_id, None)
+        self._e2e_pending.pop(tunnel_id, None)
         log.info("Tunnel %s closed", tunnel_id.hex()[:12])
+    async def _handle_e2e_data(
+        self,
+        tunnel_id: bytes,
+        payload: bytes,
+        encrypted: bool,
+    ) -> bytes:
+        if not encrypted:
+            inner_frame = Frame.decode(payload)
+            if inner_frame.msg_type == MessageType.HANDSHAKE_INIT:
+                hs = ResponderHandshake(self._identity)
+                ack = hs.process_hello(inner_frame.payload)
+                self._e2e_pending[tunnel_id] = hs
+                response_inner = Frame(
+                    msg_type=MessageType.HANDSHAKE_ACK,
+                    request_id=inner_frame.request_id,
+                    payload=ack,
+                ).encode()
+                return response_inner
+            if inner_frame.msg_type == MessageType.HANDSHAKE_FINISH:
+                hs = self._e2e_pending.pop(tunnel_id, None)
+                if hs is not None:
+                    hs.process_finish(inner_frame.payload)
+                    if hs.session is not None:
+                        self._e2e_sessions[tunnel_id] = hs.session
+                response_inner = Frame(
+                    msg_type=MessageType.APP_ACK,
+                    request_id=inner_frame.request_id,
+                    payload=b"",
+                ).encode()
+                return response_inner
+            raise RuntimeError(
+                f"Неизвестный plaintext inner type: {inner_frame.msg_type}"
+            )
+
+        session = self._e2e_sessions.get(tunnel_id)
+        if session is None:
+            raise RuntimeError("E2E сессия не установлена")
+
+        if len(payload) < 24:
+            raise RuntimeError("E2E payload слишком короткий")
+        sid = payload[:16]
+        counter = int.from_bytes(payload[16:24], "big")
+        ct = payload[24:]
+        if sid != session.session_id:
+            raise RuntimeError("session_id не совпадает")
+        aad = sid + counter.to_bytes(8, "big")
+        inner_bytes = session.recv_aead.decrypt(counter, ct, aad=aad)
+        inner_frame = Frame.decode(inner_bytes)
+
+        if inner_frame.msg_type != MessageType.APP_MESSAGE:
+            raise RuntimeError(
+                f"Ожидался APP_MESSAGE, получен {inner_frame.msg_type}"
+            )
+        result = await self._on_app_message(inner_frame)
+
+        response_inner = Frame(
+            msg_type=MessageType.APP_ACK,
+            request_id=inner_frame.request_id,
+            payload=result,
+        ).encode()
+        pre = session.send_aead.send_counter
+        resp_aad = sid + pre.to_bytes(8, "big")
+        resp_counter, resp_ct = session.send_aead.encrypt(
+            response_inner, aad=resp_aad
+        )
+        return sid + resp_counter.to_bytes(8, "big") + resp_ct
+
+    async def _on_app_message(self, inner_frame: Frame) -> bytes:
+        payload = inner_frame.payload
+        return b"delivered:" + payload[:32]
+
+    async def open_secure_tunnel(
+        self,
+        destination: Contact,
+        relay_count: int = 3,
+    ) -> SecureTunnel:
+        route = await self.build_tunnel(
+            destination, relay_count=relay_count
+        )
+        if route.state != TunnelState.ACTIVE:
+            raise RuntimeError(
+                f"Не удалось построить туннель (state={route.state.value})"
+            )
+
+        initiator = InitiatorHandshake(self._identity)
+        hello = initiator.create_hello()
+        inner_hello = Frame(
+            msg_type=MessageType.HANDSHAKE_INIT,
+            request_id=secrets.token_bytes(16),
+            payload=hello,
+        ).encode()
+
+        ack_payload = await self.send_via_tunnel(
+            route.tunnel_id, inner_hello, encrypted=False
+        )
+        inner_ack = Frame.decode(ack_payload)
+        if inner_ack.msg_type != MessageType.HANDSHAKE_ACK:
+            await self.close_tunnel(route.tunnel_id)
+            raise RuntimeError(
+                f"Ожидался HANDSHAKE_ACK, получен {inner_ack.msg_type}"
+            )
+
+        finish = initiator.process_hello_ack(inner_ack.payload)
+        inner_finish = Frame(
+            msg_type=MessageType.HANDSHAKE_FINISH,
+            request_id=secrets.token_bytes(16),
+            payload=finish,
+        ).encode()
+        await self.send_via_tunnel(
+            route.tunnel_id, inner_finish, encrypted=False
+        )
+
+        if initiator.session is None:
+            await self.close_tunnel(route.tunnel_id)
+            raise RuntimeError("E2E сессия не создана")
+
+        log.info(
+            "E2E handshake через туннель %s с %s: session=%s",
+            route.tunnel_id.hex()[:12],
+            destination.node_id_hex[:12],
+            initiator.session.session_id.hex(),
+        )
+
+        return SecureTunnel(
+            self, route.tunnel_id, destination, initiator.session
+        )
+
+    async def close_secure_tunnel(self, secure: SecureTunnel) -> None:
+        secure.close()
+        self._e2e_sessions.pop(secure.tunnel_id, None)
+        self._e2e_pending.pop(secure.tunnel_id, None)
+        await self.close_tunnel(secure.tunnel_id)
