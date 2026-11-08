@@ -73,3 +73,71 @@ def build_plan(scheme: str, contacts: list[Contact]) -> BootstrapPlan:
     if scheme == "ring":
         return build_ring(contacts)
     raise BootstrapError(f"Неизвестная bootstrap-схема: {scheme!r}")
+def build_tree(contacts: list[Contact]) -> BootstrapPlan:
+    if len(contacts) < 4:
+        raise BootstrapError("tree требует не менее 4 узлов")
+    seed = contacts[0]
+    middle = contacts[1:4]
+    leaves = contacts[4:]
+
+    seeds: dict[str, list[Contact]] = {}
+    launch_order: list[str] = [seed.node_id_hex]
+    seeds[seed.node_id_hex] = []
+
+    for m in middle:
+        seeds[m.node_id_hex] = [seed]
+        launch_order.append(m.node_id_hex)
+
+    for i, leaf in enumerate(leaves):
+        parent = middle[i % len(middle)]
+        seeds[leaf.node_id_hex] = [parent]
+        launch_order.append(leaf.node_id_hex)
+
+    return BootstrapPlan(
+        scheme="tree",
+        n_nodes=len(contacts),
+        seeds=seeds,
+        launch_order=launch_order,
+    )
+
+
+def build_multi_seed(
+    contacts: list[Contact],
+    seed_count: int = 3,
+) -> BootstrapPlan:
+    if seed_count < 1:
+        raise BootstrapError("seed_count должен быть >= 1")
+    if len(contacts) < seed_count + 1:
+        raise BootstrapError(
+            f"multi_seed требует не менее {seed_count + 1} узлов"
+        )
+    seeds_list = contacts[:seed_count]
+    leaves = contacts[seed_count:]
+
+    seeds: dict[str, list[Contact]] = {}
+    launch_order: list[str] = []
+    for s in seeds_list:
+        seeds[s.node_id_hex] = []
+        launch_order.append(s.node_id_hex)
+    for leaf in leaves:
+        seeds[leaf.node_id_hex] = list(seeds_list)
+        launch_order.append(leaf.node_id_hex)
+
+    return BootstrapPlan(
+        scheme="multi-seed",
+        n_nodes=len(contacts),
+        seeds=seeds,
+        launch_order=launch_order,
+    )
+
+
+def build_plan(scheme: str, contacts: list[Contact]) -> BootstrapPlan:
+    if scheme == "star":
+        return build_star(contacts)
+    if scheme == "ring":
+        return build_ring(contacts)
+    if scheme == "tree":
+        return build_tree(contacts)
+    if scheme in ("multi-seed", "multi_seed"):
+        return build_multi_seed(contacts)
+    raise BootstrapError(f"Неизвестная bootstrap-схема: {scheme!r}")

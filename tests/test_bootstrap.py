@@ -7,6 +7,8 @@ from overlay.bootstrap import (
     build_plan,
     build_ring,
     build_star,
+    build_multi_seed,
+    build_tree
 )
 from overlay.dht.contact import Contact
 
@@ -114,3 +116,49 @@ def test_random_contacts_do_not_collide():
     for seeds in plan.seeds.values():
         for s in seeds:
             assert s.node_id_hex in all_ids
+def test_tree_requires_four_nodes():
+    with pytest.raises(BootstrapError):
+        build_tree([_contact(0), _contact(1), _contact(2)])
+
+
+def test_tree_launch_order_and_parents():
+    contacts = [_contact(i) for i in range(8)]
+    plan = build_tree(contacts)
+
+    assert plan.scheme == "tree"
+    assert plan.n_nodes == 8
+    assert plan.launch_order[0] == contacts[0].node_id_hex
+    assert plan.seeds_for(contacts[0].node_id_hex) == []
+
+    for m in contacts[1:4]:
+        assert plan.seeds_for(m.node_id_hex) == [contacts[0]]
+
+    for i, leaf in enumerate(contacts[4:]):
+        parent = contacts[1 + (i % 3)]
+        assert plan.seeds_for(leaf.node_id_hex) == [parent]
+
+
+def test_multi_seed_requires_seed_plus_leaf():
+    with pytest.raises(BootstrapError):
+        build_multi_seed([_contact(0), _contact(1)], seed_count=3)
+
+
+def test_multi_seed_launch_order_and_seeds():
+    contacts = [_contact(i) for i in range(8)]
+    plan = build_multi_seed(contacts, seed_count=3)
+
+    assert plan.scheme == "multi-seed"
+    for s in contacts[:3]:
+        assert plan.seeds_for(s.node_id_hex) == []
+    for leaf in contacts[3:]:
+        assert plan.seeds_for(leaf.node_id_hex) == contacts[:3]
+
+
+def test_build_plan_accepts_tree_and_multi_seed():
+    contacts = [_contact(i) for i in range(8)]
+    p1 = build_plan("tree", contacts)
+    p2 = build_plan("multi-seed", contacts)
+    p3 = build_plan("multi_seed", contacts)
+    assert p1.scheme == "tree"
+    assert p2.scheme == "multi-seed"
+    assert p3.scheme == "multi-seed"          
