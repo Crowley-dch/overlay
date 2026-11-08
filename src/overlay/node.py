@@ -1022,7 +1022,10 @@ class Node:
         encrypted: bool,
     ) -> bytes:
         if not encrypted:
-            inner_frame = Frame.decode(payload)
+            try:
+                inner_frame = Frame.decode(payload)
+            except FrameError:
+                return b"delivered:" + payload[:32]
             if inner_frame.msg_type == MessageType.HANDSHAKE_INIT:
                 hs = ResponderHandshake(self._identity)
                 ack = hs.process_hello(inner_frame.payload)
@@ -1052,7 +1055,6 @@ class Node:
         session = self._e2e_sessions.get(tunnel_id)
         if session is None:
             raise RuntimeError("E2E сессия не установлена")
-
         if len(payload) < 24:
             raise RuntimeError("E2E payload слишком короткий")
         sid = payload[:16]

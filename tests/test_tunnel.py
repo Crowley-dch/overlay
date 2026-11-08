@@ -264,9 +264,11 @@ def test_build_tunnel_fails_when_relay_unreachable(tmp_path: Path):
             )
             original_select = a._select_relays
 
-            def select_with_dead(destination, count):
-                return [fake_relay, *original_select(destination, count - 1)]
-
+            def select_with_dead(destination, count, exclude=None):
+                return [
+                    fake_relay,
+                    *original_select(destination, count - 1, exclude=exclude),
+                ]
             a._select_relays = select_with_dead
 
             route = await a.build_tunnel(
