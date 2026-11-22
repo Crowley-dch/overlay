@@ -86,6 +86,8 @@ class SecureTunnel:
     async def _recover(self) -> None:
         failed = await self._node.detect_failed_relays(self._tunnel_id)
         self._node.mark_relays_failed(failed)
+        for nid in failed:
+            self._node._relay_profiles.record_failure(nid)
         try:
             await self._node.close_tunnel(self._tunnel_id)
         except Exception:

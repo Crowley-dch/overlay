@@ -16,6 +16,7 @@ from overlay.dht.wire import (
     encode_find_node_request,
     encode_find_node_response,
 )
+from overlay.tunnel.relay_profile import RelayProfileStore
 from overlay.transport.secure import SecureConnection, SecureConnectionError
 from overlay.transport.types import TransportLike
 from overlay.identity import Identity, IdentityStore
@@ -97,6 +98,7 @@ class Node:
         self._relay_states: dict[bytes, RelayState] = {}
         self._identity_store = IdentityStore(config.node.state_dir)
         self._identity = self._identity_store.load_or_create()
+        self._relay_profiles = RelayProfileStore()
         self._maintenance_task: asyncio.Task | None = None
         self._routing = ContactManager(
             self_id=self._identity.node_id,
@@ -144,6 +146,10 @@ class Node:
     @property
     def routing(self) -> ContactManager:
         return self._routing
+    
+    @property
+    def relay_profiles(self) -> RelayProfileStore:
+        return self._relay_profiles
 
     def self_contact(self) -> Contact:
         return Contact(
@@ -639,6 +645,8 @@ class Node:
         count: int,
         exclude: set[bytes] | None = None,
     ) -> list[Contact]:
+        import random
+
         now = time.time()
         exclude = exclude or set()
         candidates = [
@@ -649,7 +657,19 @@ class Node:
             and c.node_id not in exclude
             and self._failed_relays.get(c.node_id, 0.0) < now
         ]
-        return candidates[:count]
+        if not candidates:
+            return []
+
+        strategy = self._config.dht.relay_strategy
+        if strategy == "random":
+            random.shuffle(candidates)
+            return candidates[:count]
+
+        scored = [
+            (self._relay_profiles.score(c.node_id), c) for c in candidates
+        ]
+        scored.sort(key=lambda x: -x[0])
+        return [c for _, c in scored[:count]]
 
     def mark_relays_failed(self, node_ids: list[bytes]) -> None:
         deadline = time.time() + 60.0
@@ -725,7 +745,23 @@ class Node:
         finally:
             secure.close()
             await secure.wait_closed()
-
+    async def _timed_build(
+        self,
+        hop: Contact,
+        tunnel_id: bytes,
+        prev_hop: Contact | None,
+        next_hop: Contact | None,
+        max_hops: int,
+        ttl: int,
+    ) -> tuple[Contact, bool, float]:
+        started = time.monotonic()
+        try:
+            ok = await self._send_tunnel_build(
+                hop, tunnel_id, prev_hop, next_hop, max_hops, ttl
+            )
+        except Exception:
+            ok = False
+        return (hop, ok, time.monotonic() - started)
     async def build_tunnel(
         self,
         destination: Contact,
@@ -758,12 +794,22 @@ class Node:
             prev_hop = hops[i - 1]
             next_hop = hops[i + 1] if i + 1 < len(hops) else None
             build_tasks.append(
-                self._send_tunnel_build(
+                self._timed_build(
                     hop, tunnel_id, prev_hop, next_hop, len(hops), ttl
                 )
             )
         results = await asyncio.gather(*build_tasks, return_exceptions=True)
-        ok_count = sum(1 for r in results if r is True)
+
+        ok_count = 0
+        for r in results:
+            if isinstance(r, BaseException):
+                continue
+            hop, ok, latency = r
+            if ok:
+                self._relay_profiles.record_success(hop.node_id, latency)
+                ok_count += 1
+            else:
+                self._relay_profiles.record_failure(hop.node_id)
 
         if ok_count == len(hops) - 1:
             route.state = TunnelState.ACTIVE
@@ -1090,8 +1136,13 @@ class Node:
         return sid + resp_counter.to_bytes(8, "big") + resp_ct
 
     async def _on_app_message(self, inner_frame: Frame) -> bytes:
-        return self._file_receiver.handle(inner_frame.payload)
+        from overlay.app.file import FileError, decode_app_payload
 
+        try:
+            decode_app_payload(inner_frame.payload)
+        except FileError:
+            return b"delivered:" + inner_frame.payload[:32]
+        return self._file_receiver.handle(inner_frame.payload)
     async def open_secure_tunnel(
         self,
         destination: Contact,

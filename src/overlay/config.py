@@ -32,7 +32,7 @@ class DhtConfig:
     k: int = 4
     alpha: int = 3
     replication_factor: int = 3
-
+    relay_strategy: str = "rating"
 
 @dataclass(slots=True)
 class TtlConfig:
