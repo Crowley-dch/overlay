@@ -4,6 +4,7 @@ import logging
 import time
 import secrets
 import asyncio
+from pathlib import Path
 from overlay.config import Config
 from overlay.dht.contact import Contact
 from overlay.dht.lookup import IterativeLookup, LookupStats
@@ -114,6 +115,10 @@ class Node:
         self._store = RecordStore(
             max_record_size=config.ttl.max_record_size,
             default_ttl=config.ttl.record_ttl,
+        )
+        from overlay.app.file import FileReceiver
+        self._file_receiver = FileReceiver(
+            Path(self._config.node.state_dir) / "received"
         )
 
     @property
@@ -1085,8 +1090,7 @@ class Node:
         return sid + resp_counter.to_bytes(8, "big") + resp_ct
 
     async def _on_app_message(self, inner_frame: Frame) -> bytes:
-        payload = inner_frame.payload
-        return b"delivered:" + payload[:32]
+        return self._file_receiver.handle(inner_frame.payload)
 
     async def open_secure_tunnel(
         self,

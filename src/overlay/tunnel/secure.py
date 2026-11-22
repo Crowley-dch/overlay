@@ -110,6 +110,13 @@ class SecureTunnel:
                 raise
             await self._recover()
             return await self._attempt(message_id, payload)
+    async def send_file(
+        self, path, *, remote_name: str | None = None
+    ):
+        from overlay.app.file import FileSender
+        return await FileSender(self).send_file(
+            path, remote_name=remote_name
+        )
 
     def close(self) -> None:
         self._closed = True
