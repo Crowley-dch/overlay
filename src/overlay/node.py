@@ -803,6 +803,7 @@ class Node:
         ok_count = 0
         for r in results:
             if isinstance(r, BaseException):
+                log.warning("build exception: %r", r)
                 continue
             hop, ok, latency = r
             if ok:
@@ -810,6 +811,11 @@ class Node:
                 ok_count += 1
             else:
                 self._relay_profiles.record_failure(hop.node_id)
+                log.warning(
+                    "build fail to hop %s (latency=%.3fs)",
+                    hop.node_id_hex[:12],
+                    latency,
+                )
 
         if ok_count == len(hops) - 1:
             route.state = TunnelState.ACTIVE

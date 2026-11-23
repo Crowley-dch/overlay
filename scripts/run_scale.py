@@ -80,6 +80,12 @@ async def _start_network(
         if not seeds:
             continue
         await node.bootstrap(seeds)
+    for node_id_hex in plan.launch_order:
+        node = node_by_id[node_id_hex]
+        seeds = plan.seeds_for(node_id_hex)
+        if not seeds:
+            continue
+        await node.bootstrap(seeds)
 
     return nodes, plan, time.monotonic() - started
 
@@ -348,7 +354,7 @@ async def _relay_failure_series(
             resp_preview = resp[:32].decode("utf-8", "replace")
         except Exception as e:
             recovered = False
-            resp_preview = f"error: {e}"
+            resp_preview = f"EXC {type(e).__name__}: {e}"
         recovery_duration = time.monotonic() - started
 
         results.append({
@@ -393,13 +399,14 @@ async def _message_series(
                 "ok": ok,
                 "duration": time.monotonic() - started,
                 "response_len": len(resp),
+                "resp_preview": resp[:60].decode("utf-8", "replace") if not ok else "",
             })
         except Exception as e:
             results.append({
                 "i": i,
                 "ok": False,
                 "duration": time.monotonic() - started,
-                "error": str(e),
+                "error": repr(e),
             })
     return results
 
@@ -459,6 +466,11 @@ async def run(
         cfg_path, n, run_dir
     )
     try:
+        relay_failures_count = (
+            1 if n < 10 else min(5, max(1, (n - 5) // 1))
+        )
+        store_failures_count = min(5, max(1, n // 3))
+
         convergence = await _wait_convergence(nodes)
 
         nondegeneracy = await _nondegeneracy_check(
@@ -469,14 +481,17 @@ async def run(
 
         lookups = await _lookup_series(nodes, count=lookup_count)
 
-        store_failures = await _store_failure_series(nodes, count=5)
-
-        relay_failures = await _relay_failure_series(nodes, count=5)
-
         messages = await _message_series(nodes, count=30)
+
+        relay_failures = await _relay_failure_series(
+            nodes, count=relay_failures_count
+        )
 
         no_seed = await _no_seed_check(nodes, plan)
 
+        store_failures = await _store_failure_series(
+            nodes, count=store_failures_count
+        )
         routing_snapshot = {}
         for node in nodes:
             routing_snapshot[node.node_id.hex()] = {
