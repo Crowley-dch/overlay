@@ -125,52 +125,56 @@ logging:
 ## Структура 
 ```text
 overlay/
-├── ARCHITECTURE.md          проектное решение и границы этапов
+├── ARCHITECTURE.md          архитектура и границы этапов
 ├── PROTOCOL.md              спецификация кадра и типов
+├── TRACEABILITY.md          матрица требование-код-тест-данные
+├── USERGUIDE.md             руководство пользователя
 ├── configs/
-│   ├── star.yaml            star-схема
-│   ├── ring.yaml            ring-схема
-│   └── default.yaml         прежний конфиг
-├── data/                    состояние узлов и сырые данные (не коммитится)
+│   ├── star.yaml
+│   ├── ring.yaml
+│   ├── tree.yaml
+│   ├── multi_seed.yaml
+│   └── default.yaml
+├── data/                    состояние и результаты (не коммитится)
 ├── scripts/
-│   ├── ping_server.py
-│   ├── ping_client.py
-│   ├── smoke_ping.py
-│   └── run_bootstrap.py     раннер bootstrap-схем
+│   ├── ping_server.py / ping_client.py / smoke_ping.py
+│   ├── run_bootstrap.py
+│   ├── run_scale.py
+│   ├── compare_relay_strategies.py
+│   └── analyze.py
 ├── src/overlay/
-│   ├── config.py            загрузка YAML в dataclass
+│   ├── config.py
 │   ├── node.py              объединяет identity, DHT, store, tunnel
 │   ├── transport/
-│   │   ├── frame.py         заголовок 24 байта, FrameBuffer
+│   │   ├── frame.py         24-байтовый заголовок, FrameBuffer
 │   │   ├── connection.py    асинхронное соединение
 │   │   ├── server.py        приём соединений
-│   │   ├── rpc.py           корреляция запросов по request_id
-│   │   ├── secure.py        SecureConnection (handshake + AEAD)
-│   │   └── types.py         TransportLike-протокол
+│   │   ├── rpc.py           корреляция request_id
+│   │   ├── secure.py        SecureConnection
+│   │   └── types.py         TransportLike
 │   ├── identity/
 │   │   ├── node_id.py       SHA-256(canonical_encode(pubkey))
-│   │   ├── keypair.py       обёртка над Ed25519
+│   │   ├── keypair.py       Ed25519
 │   │   └── store.py         load_or_create с правами 0600
-│   ├── crypto/              примитивы учебного AKE
+│   ├── crypto/
 │   │   ├── hkdf.py          HKDF-SHA-256, направленные ключи
-│   │   ├── aead.py          AES-GCM и ChaCha20-Poly1305, replay-защита
-│   │   └── handshake.py     трёхшаговый AKE hello/ack/finish
+│   │   ├── aead.py          AES-GCM и ChaCha20-Poly1305, replay
+│   │   └── handshake.py     hello / hello_ack / finish
 │   ├── dht/
-│   │   ├── xor.py           XOR-метрика, bucket_index
-│   │   ├── contact.py       Contact(node_id, host, port)
-│   │   ├── kbucket.py       k-bucket с LRU
-│   │   ├── routing.py       таблица из 256 бакетов
+│   │   ├── xor.py / contact.py / kbucket.py / routing.py
 │   │   ├── manager.py       ContactManager + ping_fn
-│   │   ├── lookup.py        итеративный lookup ALPHA=3
-│   │   ├── wire.py          JSON-сериализация FIND_NODE/STORE/FIND_VALUE
-│   │   ├── record.py        NodeRecord с подписью и валидацией
-│   │   └── store.py         RecordStore с TTL и rollback-защитой
-│   ├── tunnel/              оверлейная передача
-│   │   ├── state.py         TunnelState
-│   │   ├── route.py         TunnelRoute и RelayState
-│   │   └── wire.py          TUNNEL_BUILD/DATA/ACK/CLOSE
-│   ├── bootstrap.py         star/ring планы
+│   │   ├── lookup.py        итеративный ALPHA=3
+│   │   ├── wire.py          JSON-сериализация
+│   │   ├── record.py        NodeRecord с подписью
+│   │   └── store.py         RecordStore с TTL и rollback
+│   ├── tunnel/
+│   │   ├── state.py / route.py / wire.py
+│   │   ├── secure.py        SecureTunnel E2E
+│   │   └── relay_profile.py EMA успешности и задержки
+│   ├── app/
+│   │   └── file.py          передача файлов
+│   ├── bootstrap.py         star / ring / tree / multi-seed
 │   └── metrics/
-│       └── writer.py        new_run_dir, write_json
-└── tests/
+│       └── writer.py
+└── tests/                   221 тест
 ```
